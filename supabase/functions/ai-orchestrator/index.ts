@@ -12,7 +12,10 @@
 // no admin escalation (CLAUDE.md §3.2).
 //
 // Deploy with: npx supabase functions deploy ai-orchestrator
-// Required secrets: GROQ_API_KEY (npx supabase secrets set ...)
+// Required secrets: GROQ_API_KEY (npx supabase secrets set ...), and
+// TOGETHER_API_KEY for the image_generation task specifically (a second,
+// separate provider — Groq doesn't do image generation; see
+// providers/together.ts).
 //
 // Provider note: currently using Groq (see providers/groq.ts) to control
 // cost pre-revenue. Swapping back to Claude later is a one-line import
@@ -23,12 +26,26 @@
 import { serve } from "https://deno.land/std@0.192.0/http/server.ts";
 import { encodeBase64 } from "https://deno.land/std@0.192.0/encoding/base64.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
-import { analyzeFloorPlanWithGroq, generateSpaceLayoutsWithGroq } from "./providers/groq.ts";
+import { analyzeFloorPlanWithGroq, generateSpaceLayoutsWithGroq, generateDesignConsultationWithGroq } from "./providers/groq.ts";
+import { generateImageWithTogether } from "./providers/together.ts";
+import { checkRateLimit } from "../_shared/rateLimit.ts";
+import { logServerError } from "../_shared/errorLog.ts";
+import { CORS_HEADERS } from "../_shared/cors.ts";
+
+// Sprint 10 — a per-user ceiling on AI calls per minute. This is
+// deliberately generous (real abuse looks like hundreds/minute, not
+// tens) — it exists to stop a runaway client-side loop or a scripted
+// abuse attempt from generating unbounded provider cost, not to throttle
+// normal designer usage. Plan-based monthly ceilings are a separate,
+// higher-level check (see src/services/subscriptionService.ts) enforced
+// in the UI before the call is even made.
+const AI_CALLS_PER_MINUTE_LIMIT = 20;
 
 type AITaskType =
   | "floor_plan_analysis"
   | "space_planning"
   | "design_consultant"
+  | "image_generation"
   | "budget_optimizer";
 
 interface OrchestratorRequest {
@@ -40,10 +57,20 @@ const SUPPORTED_TASKS: AITaskType[] = [
   "floor_plan_analysis",
   "space_planning",
   "design_consultant",
+  "image_generation",
   "budget_optimizer",
 ];
 
 serve(async (req) => {
+  // Must come before anything else: the browser sends this preflight for
+  // every cross-origin call that carries an Authorization header (i.e.
+  // every real call this function ever receives). Respond immediately —
+  // don't fall into req.json() below, which has no body to parse on an
+  // OPTIONS request.
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
   try {
     const { task, payload } = (await req.json()) as OrchestratorRequest;
 
@@ -62,16 +89,39 @@ serve(async (req) => {
       { global: { headers: { Authorization: authHeader } } }
     );
 
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) {
+      return jsonResponse({ error: "Invalid or expired session." }, 401);
+    }
+
+    const rateLimit = await checkRateLimit("ai_orchestrator", user.id, AI_CALLS_PER_MINUTE_LIMIT, 60);
+    if (!rateLimit.allowed) {
+      return jsonResponse(
+        { error: "Too many AI requests — please wait a moment and try again." },
+        429,
+        rateLimit.retryAfterSeconds ? { "Retry-After": String(rateLimit.retryAfterSeconds) } : undefined
+      );
+    }
+
     if (task === "floor_plan_analysis") {
       return await handleFloorPlanAnalysis(supabase, payload);
     }
     if (task === "space_planning") {
       return await handleSpacePlanning(supabase, payload);
     }
+    if (task === "design_consultant") {
+      return await handleDesignConsultant(supabase, payload);
+    }
+    if (task === "image_generation") {
+      return await handleImageGeneration(supabase, payload);
+    }
 
-    // The remaining two AI tasks (design consultant, budget optimizer)
-    // aren't implemented yet — see their types in src/types/ai.ts for the
-    // intended contract. Rather than fabricate plausible-looking output,
+    // Budget Optimizer isn't implemented yet — see its type in
+    // src/types/ai.ts for the intended contract. Rather than fabricate
+    // plausible-looking output, return an explicitly-labeled dev fallback
+    // until a real provider adapter exists for it (CLAUDE.md §7).
     // return an explicitly-labeled dev fallback until a real provider
     // adapter exists for them (CLAUDE.md §7).
     return jsonResponse({
@@ -83,6 +133,7 @@ serve(async (req) => {
       is_dev_fallback: true,
     });
   } catch (err) {
+    await logServerError("ai-orchestrator", err);
     return jsonResponse(
       { error: err instanceof Error ? err.message : "Unknown error" },
       500
@@ -351,10 +402,256 @@ async function handleSpacePlanning(
   }
 }
 
-function jsonResponse(body: unknown, status = 200) {
+async function handleDesignConsultant(
+  supabase: SupabaseClient,
+  payload: Record<string, unknown>
+) {
+  const roomId = payload.room_id as string | undefined;
+  const dimensions = payload.dimensions as
+    | { width: number; length: number; ceiling_height: number | null }
+    | undefined;
+  const existingFurniture =
+    (payload.existing_furniture as { furnitureType: string }[] | undefined) ?? [];
+  const style = (payload.style as string | undefined) ?? "";
+  const budget = (payload.budget as number | null | undefined) ?? null;
+  const currency = (payload.currency as string | undefined) ?? "INR";
+  const preferredMaterials = (payload.preferred_materials as string[] | undefined) ?? [];
+
+  if (!roomId || !dimensions) {
+    return jsonResponse({ error: "Missing room_id or dimensions." }, 400);
+  }
+
+  const { data: roomRow, error: roomError } = await supabase
+    .from("rooms")
+    .select("project_id, room_type")
+    .eq("id", roomId)
+    .maybeSingle();
+
+  if (roomError || !roomRow) {
+    return jsonResponse({ error: "Room not found or not accessible." }, 404);
+  }
+  const projectId = roomRow.project_id as string;
+  const provider = "groq";
+
+  const { data: generation, error: genError } = await supabase
+    .from("ai_generations")
+    .insert({
+      project_id: projectId,
+      task_type: "design_consultant",
+      provider,
+      input: payload,
+      status: "processing",
+    })
+    .select("*")
+    .single();
+
+  if (genError || !generation) {
+    return jsonResponse(
+      { error: `Failed to log AI generation: ${genError?.message}` },
+      500
+    );
+  }
+
+  try {
+    const hasProviderKey = Boolean(Deno.env.get("GROQ_API_KEY"));
+    let result;
+    let isDevFallback = false;
+
+    if (!hasProviderKey) {
+      result = {
+        design_direction: "DEV FALLBACK: no AI provider configured (set GROQ_API_KEY).",
+        color_palette: [],
+        materials: [],
+        lighting: [],
+        furniture_recommendations: [],
+        potential_issues: [],
+      };
+      isDevFallback = true;
+    } else {
+      result = await generateDesignConsultationWithGroq({
+        roomType: (roomRow.room_type as string) ?? "room",
+        widthFt: dimensions.width,
+        lengthFt: dimensions.length,
+        ceilingHeightFt: dimensions.ceiling_height,
+        existingFurniture: existingFurniture.map((f) => f.furnitureType),
+        style,
+        budget,
+        currency,
+        preferredMaterials,
+      });
+    }
+
+    await supabase
+      .from("ai_generations")
+      .update({ status: "completed", output: result })
+      .eq("id", generation.id);
+
+    return jsonResponse({
+      generation_id: generation.id,
+      provider,
+      status: "completed",
+      output: result,
+      error: null,
+      is_dev_fallback: isDevFallback,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Design consultation failed.";
+
+    await supabase
+      .from("ai_generations")
+      .update({ status: "failed", error: message })
+      .eq("id", generation.id);
+
+    return jsonResponse({
+      generation_id: generation.id,
+      provider,
+      status: "failed",
+      output: null,
+      error: message,
+      is_dev_fallback: false,
+    });
+  }
+}
+
+async function handleImageGeneration(
+  supabase: SupabaseClient,
+  payload: Record<string, unknown>
+) {
+  const conceptId = payload.design_concept_id as string | undefined;
+  if (!conceptId) {
+    return jsonResponse({ error: "Missing design_concept_id." }, 400);
+  }
+
+  const { data: concept, error: conceptError } = await supabase
+    .from("design_concepts")
+    .select("project_id, room_id, style, color_palette, design_brief")
+    .eq("id", conceptId)
+    .maybeSingle();
+
+  if (conceptError || !concept) {
+    return jsonResponse({ error: "Design concept not found or not accessible." }, 404);
+  }
+
+  // Architecture rule (CLAUDE.md, Sprint 7): 2D geometry is the source of
+  // truth. Re-fetch the room's REAL current dimensions and furniture from
+  // the DB rather than trusting anything the client might have sent — the
+  // request payload for this task deliberately carries nothing but the
+  // concept id (see ImageGenerationRequest in src/types/ai.ts).
+  const [{ data: room, error: roomError }, { data: furniture, error: furnitureError }] =
+    await Promise.all([
+      supabase
+        .from("rooms")
+        .select("name, room_type, width, length")
+        .eq("id", concept.room_id)
+        .maybeSingle(),
+      supabase
+        .from("project_furniture")
+        .select("furniture_item_id, furniture_items(name)")
+        .eq("room_id", concept.room_id),
+    ]);
+
+  if (roomError || !room) {
+    return jsonResponse({ error: "Room not found or not accessible." }, 404);
+  }
+  if (furnitureError) {
+    return jsonResponse({ error: `Failed to load furniture: ${furnitureError.message}` }, 500);
+  }
+
+  const projectId = concept.project_id as string;
+  const provider = "together";
+
+  const { data: generation, error: genError } = await supabase
+    .from("ai_generations")
+    .insert({
+      project_id: projectId,
+      task_type: "image_generation",
+      provider,
+      input: { design_concept_id: conceptId },
+      status: "processing",
+    })
+    .select("*")
+    .single();
+
+  if (genError || !generation) {
+    return jsonResponse(
+      { error: `Failed to log AI generation: ${genError?.message}` },
+      500
+    );
+  }
+
+  const furnitureNames = ((furniture ?? []) as { furniture_items: { name: string } | null }[])
+    .map((f) => f.furniture_items?.name)
+    .filter((name): name is string => Boolean(name));
+
+  const palette = Array.isArray(concept.color_palette) ? concept.color_palette : [];
+
+  const prompt =
+    `Interior design photograph of a ${room.room_type} measuring ${room.width}ft by ${room.length}ft. ` +
+    `Style: ${concept.style || "contemporary"}. ` +
+    (palette.length > 0 ? `Color palette: ${palette.join(", ")}. ` : "") +
+    (furnitureNames.length > 0 ? `Furniture present: ${furnitureNames.join(", ")}. ` : "") +
+    (concept.design_brief ? `Design direction: ${concept.design_brief} ` : "") +
+    `Professional interior photography, realistic lighting, wide angle.`;
+
+  try {
+    const hasProviderKey = Boolean(Deno.env.get("TOGETHER_API_KEY"));
+    if (!hasProviderKey) {
+      await supabase
+        .from("ai_generations")
+        .update({
+          status: "failed",
+          error: "TOGETHER_API_KEY is not configured — image generation skipped.",
+        })
+        .eq("id", generation.id);
+
+      return jsonResponse({
+        generation_id: generation.id,
+        provider,
+        status: "failed",
+        output: null,
+        error: "No image generation provider is configured (set TOGETHER_API_KEY).",
+        is_dev_fallback: true,
+      });
+    }
+
+    const imageResult = await generateImageWithTogether(prompt);
+
+    await supabase
+      .from("ai_generations")
+      .update({ status: "completed", output: { image_url: imageResult.url } })
+      .eq("id", generation.id);
+
+    return jsonResponse({
+      generation_id: generation.id,
+      provider,
+      status: "completed",
+      output: { image_url: imageResult.url, prompt_used: prompt },
+      error: null,
+      is_dev_fallback: false,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Image generation failed.";
+
+    await supabase
+      .from("ai_generations")
+      .update({ status: "failed", error: message })
+      .eq("id", generation.id);
+
+    return jsonResponse({
+      generation_id: generation.id,
+      provider,
+      status: "failed",
+      output: null,
+      error: message,
+      is_dev_fallback: false,
+    });
+  }
+}
+
+function jsonResponse(body: unknown, status = 200, extraHeaders?: Record<string, string>) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders },
   });
 }
 
